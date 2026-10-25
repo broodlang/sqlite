@@ -1,0 +1,39 @@
+package brood:sqlite;
+
+/// SQLite behind a connection resource. A value crosses as `cell`; a query answers its
+/// column names and its rows.
+interface db {
+  variant cell {
+    null,
+    integer(s64),
+    real(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  record rows {
+    columns: list<string>,
+    rows: list<list<cell>>,
+  }
+
+  resource connection {
+    /// Open (creating it if absent) the database at `path`, as the guest sees it, or
+    /// `:memory:`.
+    open: static func(path: string) -> result<connection, string>;
+    /// Run one statement; the number of rows it changed.
+    execute: func(sql: string, params: list<cell>) -> result<u64, string>;
+    /// Run a batch of statements separated by `;`, without parameters.
+    execute-batch: func(sql: string) -> result<_, string>;
+    /// Run one statement and collect every row.
+    query: func(sql: string, params: list<cell>) -> result<rows, string>;
+    /// The rowid of the last successful insert.
+    last-insert-rowid: func() -> s64;
+  }
+
+  /// The SQLite library's version, e.g. "3.46.0".
+  version: func() -> string;
+}
+
+world sqlite {
+  export db;
+}

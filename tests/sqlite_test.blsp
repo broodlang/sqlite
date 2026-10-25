@@ -1,0 +1,113 @@
+;; SQLite through the component: values both ways, files, errors, transactions, sharing.
+
+(defmodule sqlite-test (:use test))
+
+(purge-stale-temp "brood-sqlite-")
+
+(defn- scratch-db ()
+  (let (dir (temp-dir "brood-sqlite-")) (file/mkdir dir) (path/join dir "test.db")))
+
+(defn- users (db)
+  (sqlite/execute-batch db
+    "create table users (id integer primary key, name text not null unique, score real, avatar blob)")
+  db)
+
+(describe "sqlite: values"
+  (test "every SQL type comes back as the Brood value it went in as"
+    (let (db (users (sqlite/open ":memory:")))
+      (sqlite/execute db
+        "insert into users (name, score, avatar) values (?, ?, ?)"
+        "ada"
+        9.5
+        (string/->bytes "png"))
+      (assert= [{:id 1 :name "ada" :score 9.5 :avatar (string/->bytes "png")}]
+        (sqlite/query db "select * from users"))
+      (sqlite/execute db "insert into users (name) values (?)" "bob")
+      (assert= {:id 2 :name "bob" :score nil :avatar nil}
+        (sqlite/query-one db "select * from users where name = ?" "bob"))
+      (sqlite/close db)))
+  (test "a boolean binds as 1 or 0, a keyword as its name, an empty blob as an empty blob"
+    (let (db (sqlite/open ":memory:"))
+      (assert= {:t 1 :f 0 :k "ready" :b (string/->bytes "")}
+        (sqlite/query-one db
+          "select ? as t, ? as f, ? as k, ? as b"
+          true
+          false
+          :ready (string/->bytes "")))
+      (sqlite/close db)))
+  (test "query-rows keeps the column order"
+    (let (db (sqlite/open ":memory:"))
+      (assert= {:columns ["b" "a"] :rows [[2 1]]} (sqlite/query-rows db "select 2 as b, 1 as a"))
+      (sqlite/close db)))
+  (test "a value with no SQL type is refused before it is sent"
+    (let (db (sqlite/open ":memory:"))
+      (assert-error (sqlite/execute db "select ?" {:a 1}))
+      (sqlite/close db))))
+
+(describe "sqlite: statements"
+  (test "execute counts changed rows, and last-insert-rowid names the new one"
+    (let (db (users (sqlite/open ":memory:")))
+      (assert= 1 (sqlite/execute db "insert into users (name) values (?)" "ada"))
+      (assert= 1 (sqlite/last-insert-rowid db))
+      (sqlite/execute db "insert into users (name) values (?)" "bob")
+      (assert= 2 (sqlite/execute db "update users set score = ?" 1.0))
+      (sqlite/close db)))
+  (test "a bad statement raises with SQLite's message, and the connection lives on"
+    (let (db (users (sqlite/open ":memory:")))
+      (sqlite/execute db "insert into users (name) values (?)" "ada")
+      (is (includes? (try
+                       (sqlite/execute db "insert into users (name) values (?)" "ada")
+                       (catch e (error-message e)))
+            "UNIQUE constraint failed"))
+      (is (includes? (try (sqlite/query db "select * from nowhere") (catch e (error-message e)))
+            "no such table"))
+      (assert= 1 (count (sqlite/query db "select * from users")))
+      (sqlite/close db))))
+
+(describe "sqlite: files"
+  (test "a database file persists across handles"
+    (let (file (scratch-db)
+          db (users (sqlite/open file)))
+      (sqlite/execute db "insert into users (name) values (?)" "ada")
+      (sqlite/close db)
+      (is (file/exists? file))
+      (let (again (sqlite/open file))
+        (assert= [{:name "ada"}] (sqlite/query again "select name from users"))
+        (sqlite/close again))))
+  (test "a database whose directory does not exist is refused at open"
+    (assert-error (sqlite/open "/no/such/directory/x.db"))))
+
+(describe "sqlite: transactions"
+  (test "a transaction commits what its function did"
+    (let (db (users (sqlite/open ":memory:")))
+      (assert= :done
+        (sqlite/transaction db
+          (fn ()
+            (sqlite/execute db "insert into users (name) values (?)" "ada")
+            (sqlite/execute db "insert into users (name) values (?)" "bob")
+            :done)))
+      (assert= 2 (count (sqlite/query db "select * from users")))
+      (sqlite/close db)))
+  (test "a raise rolls everything back and is raised again"
+    (let (db (users (sqlite/open ":memory:")))
+      (assert-error (sqlite/transaction db
+                      (fn ()
+                        (sqlite/execute db "insert into users (name) values (?)" "ada")
+                        (error "changed my mind"))))
+      (assert= [] (sqlite/query db "select * from users"))
+      (sqlite/close db))))
+
+(describe "sqlite: a handle is a process"
+  (test "many processes write through one handle"
+    (let (db (users (sqlite/open ":memory:"))
+          me (self))
+      (doseq (n (range 20))
+        (spawn (do
+                 (sqlite/execute db "insert into users (name) values (?)" (str "user-" n))
+                 (send me :written))))
+      (doseq (_ (range 20))
+        (receive (:written nil)))
+      (assert= {:n 20} (sqlite/query-one db "select count(*) as n from users"))
+      (sqlite/close db)))
+  (test "the library inside reports its version"
+    (is (string/starts-with? (sqlite/version) "3."))))

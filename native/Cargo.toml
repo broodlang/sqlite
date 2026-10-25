@@ -1,0 +1,23 @@
+# SQLite as a WebAssembly component (brood ADR-453/454). Built once and committed as
+# native/sqlite.wasm, so a consumer of the package needs no toolchain; `make wasm`
+# rebuilds it, and needs the wasm32-wasip2 Rust target and wasi-sdk (for SQLite's C).
+[package]
+name = "brood-sqlite"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
+wit-bindgen = { version = "0.46", default-features = false, features = ["macros", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
+
+[workspace]

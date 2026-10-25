@@ -1,0 +1,186 @@
+;; sqlite — SQLite for Brood, as a WebAssembly component (brood ADR-453/454).
+;;
+;; The SQLite library is C, so it reaches Brood the way the language takes native code: a
+;; sandboxed component (native/sqlite.wasm, built from native/ and committed), spliced into
+;; the program by `include-bytes` and run by the runtime's wasmtime host. It sees one
+;; directory — the database's — and nothing else of the machine.
+;;
+;; A connection is a PROCESS, the language's rule for mutable state: it loads the component,
+;; holds the SQLite connection, and answers calls one at a time, so any process that has the
+;; handle can use it and statements never interleave inside SQLite. Disk work runs on the
+;; offload pool (`wasm/call-blocking`), so a slow write blocks the caller, not a scheduler
+;; worker. Closing it, or its exit, frees the component.
+(defmodule sqlite
+  "SQLite as a sandboxed WebAssembly component: `open` a database file (or `:memory:`),
+  then `execute`, `query` and `transaction` on the handle it returns. The handle is a
+  process, so it can be shared; it sees only the database's directory."
+  (:alias gen)
+  (:alias wasm)
+  (:alias path))
+
+(def- *component* (include-bytes "native/sqlite.wasm"))
+
+;; How long a call waits for the connection process. A statement runs on the offload pool
+;; and SQLite never blocks on another connection here (there is none), so this bounds a
+;; runaway query rather than a queue.
+(def *call-timeout* 60000)
+
+;; ---- values across the boundary ---------------------------------------------------
+;; A SQL value crosses as the WIT `cell` variant: `[:null]`, `[:integer n]`, `[:real x]`,
+;; `[:text s]`, `[:blob b]`.
+
+(defn ->cell (v)
+  "A Brood value as a SQL parameter: nil is NULL, an int INTEGER, a float REAL, a string TEXT,
+  `bytes` a BLOB; a boolean is 1 or 0 (SQLite has no boolean type) and a keyword its name.
+
+      (sqlite/->cell 3)     → [:integer 3]
+      (sqlite/->cell nil)   → [:null]
+      (sqlite/->cell true)  → [:integer 1]"
+  (cond
+    (nil? v) [:null]
+    (bool? v) [:integer (if v 1 0)]
+    (int? v) [:integer v]
+    (float? v) [:real v]
+    (string? v) [:text v]
+    (bytes? v) [:blob v]
+    (keyword? v) [:text (string/substring (str v) 1)]
+    else (error "sqlite: cannot bind " (pr-str v) " as a SQL value")))
+
+(defn cell-> (cell)
+  "A SQL value as Brood: NULL nil, INTEGER an int, REAL a float, TEXT a string, BLOB
+  `bytes`.
+
+      (sqlite/cell-> [:integer 3])   → 3
+      (sqlite/cell-> [:null])        → nil"
+  (case (first cell)
+    :null nil
+    ;; an empty `list<u8>` lifts as an empty vector, which is an empty blob here
+    :blob (let (b (second cell)) (if (bytes? b) b (string/->bytes "")))
+    (second cell)))
+
+;; ---- the connection process -------------------------------------------------------
+
+;; Where the guest finds the database: the file's directory is granted read-write as /db.
+(defn- grants-for (file)
+  (if (= file ":memory:")
+    [{} file]
+    (let (absolute (path/absolute file))
+      [{:dirs [[(path/dirname absolute) "/db" :write]]} (str "/db/" (path/basename absolute))])))
+
+(defn- open-in (file)
+  ;; check-allow :discarded-catch — a failed open is the server's state, reported to `open`
+  (check-allow :discarded-catch
+    (try
+      (let ([grants guest-path] (grants-for file)
+            instance (wasm/instantiate *component* grants))
+        {:instance instance
+         :connection (wasm/call-blocking instance "[static]connection.open" guest-path)})
+      (catch e {:failed (error-message e)}))))
+
+;; One component call, answered as `[:ok value]` or `[:error message]`: a bad statement
+;; is the caller's problem, never a reason for the connection to die.
+(defn- attempt (state method & args)
+  ;; check-allow :discarded-catch — the error travels to the caller in the reply
+  (check-allow :discarded-catch
+    (try
+      [:ok (apply wasm/call-blocking (get state :instance) method (get state :connection) args)]
+      (catch e [:error (error-message e)]))))
+
+(gen/defserver connection-server
+  (state)
+  (init (open-in (get state :file)))
+  (query :status (if (get state :failed) [:error (get state :failed)] [:ok nil]))
+  (call [:execute sql cells] [(attempt state "[method]connection.execute" sql cells) state])
+  (call [:batch sql] [(attempt state "[method]connection.execute-batch" sql) state])
+  (call [:query sql cells] [(attempt state "[method]connection.query" sql cells) state])
+  (call :last-insert-rowid [(attempt state "[method]connection.last-insert-rowid") state]))
+
+(defn- ask (db message)
+  (let (reply (gen/call-timeout (get db :pid) message *call-timeout*))
+    (match reply
+      ([:ok value] value)
+      ([:error message] (error "sqlite: " message)))))
+
+;; ---- the API ----------------------------------------------------------------------
+
+(defn open (file)
+  "Open the SQLite database at `file`, creating it if it does not exist, or an in-memory
+  one for `\":memory:\"`. Returns a handle for the other functions — a process, owned by
+  nobody in particular: any process may use it, and `close` ends it. The component sees
+  only `file`'s directory. Raises when the database cannot be opened.
+
+  SQLite runs without file locking here (WASI has none), so one handle per database file:
+  two handles writing one file at once can corrupt it.
+
+      (sqlite/open \"app.db\")   ;=> {:pid <pid> :file \"app.db\"}"
+  (let (pid (gen/start connection-server {:file file})
+        db {:pid pid :file file})
+    (match (gen/call-timeout pid :status *call-timeout*)
+      ([:ok _] db)
+      ([:error message] (gen/stop pid) (error "sqlite/open: " file ": " message)))))
+
+(defn close (db)
+  "Close `db`: the connection process exits and the component goes with it.
+
+      (sqlite/close db)   ;=> nil"
+  (gen/stop (get db :pid)))
+
+(defn execute (db sql & params)
+  "Run one statement with `params` bound to its `?` placeholders; the number of rows it
+  changed.
+
+      (sqlite/execute db \"insert into users (name) values (?)\" \"ada\")   ;=> 1"
+  (ask db [:execute sql (into [] (map params ->cell))]))
+
+(defn execute-batch (db sql)
+  "Run several statements separated by `;` — a schema, a migration — without parameters.
+
+      (sqlite/execute-batch db \"create table a (x); create table b (y)\")   ;=> nil"
+  (ask db [:batch sql]))
+
+(defn query-rows (db sql & params)
+  "Run a query; `{:columns [names] :rows [[values]]}`, values as `cell->` gives them.
+
+      (sqlite/query-rows db \"select 1 as one\")   ;=> {:columns [\"one\"] :rows [[1]]}"
+  (let (result (ask db [:query sql (into [] (map params ->cell))]))
+    {:columns (get result :columns)
+     :rows (into [] (map (get result :rows) (fn (row) (into [] (map row cell->)))))}))
+
+(defn query (db sql & params)
+  "Run a query; a vector of maps, one per row, keyed by column name as a keyword.
+
+      (sqlite/query db \"select id, name from users where id = ?\" 1)   ;=> [{:id 1 :name \"ada\"}]"
+  (let (result (apply query-rows db sql params)
+        names (into [] (map (get result :columns) keyword)))
+    (into [] (map (get result :rows) (fn (row) (into {} (seq/zip names row)))))))
+
+(defn query-one (db sql & params)
+  "The first row `query` would return, or nil when there is none.
+
+      (sqlite/query-one db \"select count(*) as n from users\")   ;=> {:n 1}"
+  (first (apply query db sql params)))
+
+(defn last-insert-rowid (db)
+  "The rowid of the last successful INSERT on `db`.
+
+      (sqlite/last-insert-rowid db)   ;=> 1"
+  (ask db :last-insert-rowid))
+
+(defn transaction (db f)
+  "Run `(f)` inside BEGIN … COMMIT, rolling back and re-raising if it raises; its value.
+
+  The handle is shared, so a statement another process sends to `db` while `f` runs lands
+  inside the transaction too; give a transaction its own handle when that matters.
+
+      (sqlite/transaction db (fn () (sqlite/execute db \"delete from users\")))   ;=> 1"
+  (execute db "begin")
+  (let (result (try (f) (catch e (execute db "rollback") (throw e))))
+    (execute db "commit")
+    result))
+
+(defn version ()
+  "The version of the SQLite library inside the component.
+
+      (sqlite/version)   ;=> \"3.50.2\""
+  (let (instance (wasm/instantiate *component* {}))
+    (try (wasm/call instance "version") (finally (wasm/close instance)))))
