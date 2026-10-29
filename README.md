@@ -8,14 +8,14 @@ directory and nothing else (ADR-453). Needs Brood 0.44 or later.
 ## Usage
 
 ```brood
-(def db (sqlite/open "app.db"))          ; or ":memory:"
+(def db (sqlite/open ":memory:"))        ; or a file: (sqlite/open "app.db")
 
 (sqlite/execute-batch db "create table users (id integer primary key, name text unique)")
-(sqlite/execute db "insert into users (name) values (?)" "ada")      ; => 1
-(sqlite/last-insert-rowid db)                                       ; => 1
-(sqlite/query db "select * from users where id = ?" 1)              ; => [{:id 1 :name "ada"}]
-(sqlite/query-one db "select count(*) as n from users")             ; => {:n 1}
-(sqlite/query-rows db "select id, name from users")                 ; => {:columns ["id" "name"] :rows [[1 "ada"]]}
+(sqlite/execute db "insert into users (name) values (?)" "ada")      ;=> 1
+(sqlite/last-insert-rowid db)                                       ;=> 1
+(sqlite/query db "select * from users where id = ?" 1)              ;=> [{:id 1 :name "ada"}]
+(sqlite/query-one db "select count(*) as n from users")             ;=> {:n 1}
+(sqlite/query-rows db "select id, name from users")                 ;=> {:columns ["id" "name"] :rows [[1 "ada"]]}
 
 (sqlite/transaction db
   (fn () (sqlite/execute db "update users set name = ?" "grace")))  ; commits, or rolls back and re-raises

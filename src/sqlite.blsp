@@ -33,9 +33,9 @@
   "A Brood value as a SQL parameter: nil is NULL, an int INTEGER, a float REAL, a string TEXT,
   `bytes` a BLOB; a boolean is 1 or 0 (SQLite has no boolean type) and a keyword its name.
 
-      (sqlite/->cell 3)     → [:integer 3]
-      (sqlite/->cell nil)   → [:null]
-      (sqlite/->cell true)  → [:integer 1]"
+      (sqlite/->cell 3)     ;=> [:integer 3]
+      (sqlite/->cell nil)   ;=> [:null]
+      (sqlite/->cell true)  ;=> [:integer 1]"
   (cond
     (nil? v) [:null]
     (bool? v) [:integer (if v 1 0)]
@@ -50,8 +50,8 @@
   "A SQL value as Brood: NULL nil, INTEGER an int, REAL a float, TEXT a string, BLOB
   `bytes`.
 
-      (sqlite/cell-> [:integer 3])   → 3
-      (sqlite/cell-> [:null])        → nil"
+      (sqlite/cell-> [:integer 3])   ;=> 3
+      (sqlite/cell-> [:null])        ;=> nil"
   (case (first cell)
     :null nil
     ;; an empty `list<u8>` lifts as an empty vector, which is an empty blob here
@@ -112,7 +112,7 @@
   SQLite runs without file locking here (WASI has none), so one handle per database file:
   two handles writing one file at once can corrupt it.
 
-      (sqlite/open \"app.db\")   ;=> {:pid <pid> :file \"app.db\"}"
+      (sqlite/open \"app.db\")   ;~> {:pid <pid> :file \"app.db\"}"
   (let (pid (gen/start connection-server {:file file})
         db {:pid pid :file file})
     (match (gen/call-timeout pid :status *call-timeout*)
@@ -122,26 +122,26 @@
 (defn close (db)
   "Close `db`: the connection process exits and the component goes with it.
 
-      (sqlite/close db)   ;=> nil"
+      (sqlite/close db)   ;~> nil"
   (gen/stop (get db :pid)))
 
 (defn execute (db sql & params)
   "Run one statement with `params` bound to its `?` placeholders; the number of rows it
   changed.
 
-      (sqlite/execute db \"insert into users (name) values (?)\" \"ada\")   ;=> 1"
+      (sqlite/execute db \"insert into users (name) values (?)\" \"ada\")   ;~> 1"
   (ask db [:execute sql (into [] (map params ->cell))]))
 
 (defn execute-batch (db sql)
   "Run several statements separated by `;` — a schema, a migration — without parameters.
 
-      (sqlite/execute-batch db \"create table a (x); create table b (y)\")   ;=> nil"
+      (sqlite/execute-batch db \"create table a (x); create table b (y)\")   ;~> nil"
   (ask db [:batch sql]))
 
 (defn query-rows (db sql & params)
   "Run a query; `{:columns [names] :rows [[values]]}`, values as `cell->` gives them.
 
-      (sqlite/query-rows db \"select 1 as one\")   ;=> {:columns [\"one\"] :rows [[1]]}"
+      (sqlite/query-rows db \"select 1 as one\")   ;~> {:columns [\"one\"] :rows [[1]]}"
   (let (result (ask db [:query sql (into [] (map params ->cell))]))
     {:columns (get result :columns)
      :rows (into [] (map (get result :rows) (fn (row) (into [] (map row cell->)))))}))
@@ -149,7 +149,7 @@
 (defn query (db sql & params)
   "Run a query; a vector of maps, one per row, keyed by column name as a keyword.
 
-      (sqlite/query db \"select id, name from users where id = ?\" 1)   ;=> [{:id 1 :name \"ada\"}]"
+      (sqlite/query db \"select id, name from users where id = ?\" 1)   ;~> [{:id 1 :name \"ada\"}]"
   (let (result (apply query-rows db sql params)
         names (into [] (map (get result :columns) keyword)))
     (into [] (map (get result :rows) (fn (row) (into {} (seq/zip names row)))))))
@@ -157,13 +157,13 @@
 (defn query-one (db sql & params)
   "The first row `query` would return, or nil when there is none.
 
-      (sqlite/query-one db \"select count(*) as n from users\")   ;=> {:n 1}"
+      (sqlite/query-one db \"select count(*) as n from users\")   ;~> {:n 1}"
   (first (apply query db sql params)))
 
 (defn last-insert-rowid (db)
   "The rowid of the last successful INSERT on `db`.
 
-      (sqlite/last-insert-rowid db)   ;=> 1"
+      (sqlite/last-insert-rowid db)   ;~> 1"
   (ask db :last-insert-rowid))
 
 (defn transaction (db f)
@@ -172,7 +172,7 @@
   The handle is shared, so a statement another process sends to `db` while `f` runs lands
   inside the transaction too; give a transaction its own handle when that matters.
 
-      (sqlite/transaction db (fn () (sqlite/execute db \"delete from users\")))   ;=> 1"
+      (sqlite/transaction db (fn () (sqlite/execute db \"delete from users\")))   ;~> 1"
   (execute db "begin")
   (let (result (try (f) (catch e (execute db "rollback") (throw e))))
     (execute db "commit")
