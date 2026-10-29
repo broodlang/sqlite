@@ -1,8 +1,8 @@
 ;; sqlite — SQLite for Brood, as a sandboxed WebAssembly component.
 (project
   :name "sqlite"
-  :version "0.1.0"
-  :brood ">= 0.44.0"
+  :version "0.1.1"
+  :brood ">= 0.47.0"
   :description
     "SQLite as a sandboxed WebAssembly component: open a database file or :memory:, then execute, query and transaction on a shared connection process. No native code on the host."
   :repository "https://github.com/broodlang/sqlite")
