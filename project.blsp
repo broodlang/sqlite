@@ -2,7 +2,7 @@
 (project
   :name "sqlite"
   :version "0.1.1"
-  :brood ">= 0.47.0"
+  :brood ">= 0.49.0"
   :description
     "SQLite as a sandboxed WebAssembly component: open a database file or :memory:, then execute, query and transaction on a shared connection process. No native code on the host."
   :repository "https://github.com/broodlang/sqlite")
