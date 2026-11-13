@@ -1,0 +1,114 @@
+;; sqlite/store — SQLite as a database for the `store` storage library.
+;;
+;; store is adaptor-agnostic: a repo runs its SQL through a contract map, and this module is
+;; that map over this package's connection. It needs nothing of store's to build it, so the
+;; package carries no dependency on store; a project using both has both.
+(defmodule sqlite/store
+  "store's adaptor over a SQLite connection: `(repo/open (sqlite/store/adaptor) {:database
+  \"app.db\"})`, then every repo function — queries, inserts with RETURNING, changesets,
+  preloads, migrations, transactions — runs on SQLite. A unique, foreign-key, check or
+  not-null violation raises store's error map, so a changeset's declared constraint turns
+  into a field error.")
+
+(defn placeholders (sql)
+  "`sql` with store's `$1` … `$N` placeholders written as SQLite's `?1` … `?N`, which bind by
+  number however often and in whatever order they appear. A `$` inside quoted text is text.
+
+      (sqlite/store/placeholders \"select $2, '$1' where id = $1\")   ;=> \"select ?2, '$1' where id = ?1\""
+  (let (step (fn (state character)
+               (let (quote (get state :quote)
+                     out (get state :out)
+                     dollar (get state :dollar)
+                     digit (and dollar (not (nil? (regex/find character "^[0-9]$"))))
+                     out (cond
+                           digit (conj out "?")
+                           dollar (conj out "$")
+                           else out))
+                 (cond
+                   (and (nil? quote) (= character "$")) {:quote nil :out out :dollar true}
+                   (and (nil? quote) (or (= character "'") (= character "\"")))
+                     {:quote character :out (conj out character) :dollar false}
+                   (= character quote) {:quote nil :out (conj out character) :dollar false}
+                   else {:quote quote :out (conj out character) :dollar false})))
+        finished (fold (string/->list sql) {:quote nil :out [] :dollar false} step))
+    (string/join (if (get finished :dollar) (conj (get finished :out) "$") (get finished :out)) "")))
+
+(defn- parameter (value)
+  "A store parameter as one the connection binds: a decimal goes as its text, which a NUMERIC
+  column stores as a number."
+  (if (decimal? value) (decimal/->string value) value))
+
+;; ---- errors -------------------------------------------------------------------------
+
+(def- violations
+  {"UNIQUE" :unique "FOREIGN KEY" :foreign-key "CHECK" :check "NOT NULL" :not-null})
+
+(defn- unique-index (db table columns)
+  "The name of the unique index on `table` over exactly `columns`, or nil."
+  (let (indexes (sqlite/query db
+                  (str "select index_list.name as name, group_concat(index_info.name, ',') as columns "
+                    "from pragma_index_list(?1) as index_list "
+                    "join pragma_index_info(index_list.name) as index_info "
+                    "where index_list.\"unique\" = 1 group by index_list.name")
+                  table)
+        wanted (sort columns))
+    (get (seq/find indexes (fn (index) (= (sort (string/split (get index :columns) ",")) wanted)))
+      :name)))
+
+(defn- violation-fields (db kind detail)
+  "What a violation's detail names: for UNIQUE and NOT NULL `table.column, …` (and, for
+  UNIQUE, the index that refused it, as `:constraint`); for CHECK the constraint."
+  (cond
+    (nil? detail) {}
+    (= kind :check) {:constraint detail}
+    else
+      (let (columns (map (string/split detail ", ") (fn (qualified) (string/split qualified ".")))
+            table (first (first columns))
+            names (into [] (map columns second))
+            base {:table table :column (first names)})
+        (if (= kind :unique)
+          (let (index (unique-index db table names))
+            (if index (assoc base :constraint index) base))
+          base))))
+
+(defn- store-error (db sql message)
+  "store's error map for a failed statement: the message, and for a constraint failure its
+  `:violation` with what SQLite named of it."
+  (let (base {:store-error :query :message (str "store: " message) :sql sql}
+        found (regex/find message
+                "(UNIQUE|FOREIGN KEY|CHECK|NOT NULL) constraint failed(?:: (.*))?$"))
+    (if (nil? found)
+      base
+      (let ([kind-group detail-group] (get found :groups)
+            kind (get violations (get kind-group :text)))
+        (merge base {:violation kind} (violation-fields db kind (get detail-group :text)))))))
+
+;; ---- the adaptor ----------------------------------------------------------------------
+
+(defn- run (db sql params)
+  (let (outcome (try
+                  [:ok (apply sqlite/query db (placeholders sql) (map params parameter))]
+                  (catch e [:failed (string/drop-prefix (error-message e) "sqlite: ")])))
+    (if (= (first outcome) :ok)
+      (second outcome)
+      (throw (store-error db sql (second outcome))))))
+
+(defn adaptor ()
+  "store's adaptor contract over a SQLite connection:
+
+    :start-pool      (opts) -> db         ; opts :database is the file, \":memory:\" when absent
+    :stop-pool       (db) -> nil
+    :exec            (db sql params) -> rows (maps keyed by column)
+    :with-connection (db f) -> (f run), holding the connection (`sqlite/exclusive`)
+    :columns         (db table) -> [{:name :type}…]
+
+  No `:lock-sql`: one connection holds the database, so store takes no advisory lock.
+
+      (sort (keys (sqlite/store/adaptor)))   ;=> (:columns :exec :start-pool :stop-pool :with-connection)"
+  {:start-pool (fn (opts) (sqlite/open (or (get opts :database) (get opts :db) ":memory:")))
+   :stop-pool (fn (db) (sqlite/close db))
+   :exec (fn (db sql params) (run db sql params))
+   :with-connection (fn (db f)
+                      (sqlite/exclusive db (fn () (f (fn (sql params) (run db sql params))))))
+   :columns (fn (db table)
+              (sqlite/query db "select name, type from pragma_table_info(?1)" (->string table)))})

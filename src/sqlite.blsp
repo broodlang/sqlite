@@ -77,6 +77,25 @@
          :connection (wasm/call-blocking instance "[static]connection.open" guest-path)})
       (catch e {:failed (error-message e)}))))
 
+(def- component-error-marker "the component returned an error: ")
+
+(defn- component-error (raised)
+  "What SQLite said, out of what a failed component call raised. The wasm host prints the
+  guest's `Err` string into its own message (`<method>: the component returned an error:
+  \"<text>\"`), so the text is read back out of it; anything else keeps its message."
+  (let (message (if (and (vector? raised) (= (first raised) :error) (map? (second raised)))
+                  (get (second raised) :message)
+                  (error-message raised))
+        at (index-of message component-error-marker))
+    (if (< at 0)
+      message
+      (let (printed (string/substring message (+ at (count component-error-marker))))
+        ;; check-allow :discarded-catch — a payload that is not a printed string stays as printed
+        (check-allow :discarded-catch
+          (try
+            (let (text (reflect/read-string printed)) (if (string? text) text printed))
+            (catch _ printed)))))))
+
 ;; One component call, answered as `[:ok value]` or `[:error message]`: a bad statement
 ;; is the caller's problem, never a reason for the connection to die.
 (defn- attempt (state method & args)
@@ -84,7 +103,7 @@
   (check-allow :discarded-catch
     (try
       [:ok (apply wasm/call-blocking (get state :instance) method (get state :connection) args)]
-      (catch e [:error (error-message e)]))))
+      (catch e [:error (component-error e)]))))
 
 (gen/defserver connection-server
   (state)
@@ -95,11 +114,93 @@
   (call [:query sql cells] [(attempt state "[method]connection.query" sql cells) state])
   (call :last-insert-rowid [(attempt state "[method]connection.last-insert-rowid") state]))
 
+;; ---- one process at a time --------------------------------------------------------
+;; The handle is shared, but a transaction is several statements that must not have another
+;; process's statement land between them. A second connection is no way out: WASI has no
+;; file locking, so two connections writing one file can corrupt it. So each connection has
+;; a GATE, a process that hands the connection to one process at a time: every statement
+;; passes it, and `exclusive` holds it across many.
+
+;; The connections (their pids) this process holds through `exclusive`; a statement on one of
+;; them goes straight to it.
+(defdyn *held* #{})
+
+(defn- rollback-quietly (connection)
+  ;; check-allow :discarded-catch — no open transaction is the usual answer, and fine
+  (check-allow :discarded-catch
+    (try
+      (gen/call-timeout connection [:execute "rollback" []] *call-timeout*)
+      (catch _ nil))))
+
+;; `holder` is nil, or `{:pid :watch}`: the process holding the connection and its monitor.
+(defn- gate-loop (connection connection-watch holder waiting)
+  (let (again (fn (pending) (gate-loop connection connection-watch holder pending))
+        grant (fn (pending)
+                (if (empty? pending)
+                  (gate-loop connection connection-watch nil [])
+                  (let ([caller token] (first pending))
+                    (send caller [:granted token])
+                    (gate-loop connection
+                      connection-watch
+                      {:pid caller :watch (monitor caller)}
+                      (into [] (rest pending)))))))
+    (receive
+      ([:down ^connection-watch _ _] nil)
+      ([:acquire caller token] (if (nil? holder)
+                                 (grant [[caller token]])
+                                 (again (conj waiting [caller token]))))
+      ([:release caller] (if (and holder (= caller (get holder :pid)))
+                           (do (demonitor (get holder :watch)) (grant waiting))
+                           (again waiting)))
+      ;; The holder died: whatever it began is rolled back before the next process gets the
+      ;; connection, as a server does when a client's connection drops. Any other down is
+      ;; of a holder that had already released.
+      ([:down watch _ _] (if (and holder (= watch (get holder :watch)))
+                           (do (rollback-quietly connection) (grant waiting))
+                           (again waiting)))
+      ;; A process that stopped waiting (its call timed out) is no longer in line.
+      ([:withdraw caller] (again (into [] (seq/reject waiting (fn ([waiter _]) (= waiter caller)))))))))
+
+(defn- gate (connection)
+  "The gate of `connection`: hands it to one process at a time, and exits with it."
+  (gate-loop connection (monitor connection) nil []))
+
+(defn- acquire (db)
+  (let (gate (get db :gate)
+        watch (monitor gate))
+    (send gate [:acquire (self) watch])
+    (receive
+      ([:granted ^watch] (demonitor watch) nil)
+      ([:down ^watch _ _] (error "sqlite: " (get db :file) " is closed"))
+      (after *call-timeout*
+        (demonitor watch)
+        (send gate [:withdraw (self)])
+        ;; granted as the withdrawal crossed it: hand it straight back
+        (receive ([:granted ^watch] (send gate [:release (self)])) (after 0 nil))
+        (error "sqlite: " (get db :file) " stayed busy for " *call-timeout* " ms")))))
+
+(defn exclusive (db f)
+  "Run `(f)` holding `db`, its value: the statements `f` sends run back to back, and another
+  process's statement waits until `f` returns (or raises). Inside `f`, `db` is used as
+  usual; holding it again is free. If the process dies holding it, whatever it began is
+  rolled back.
+
+      (sqlite/exclusive db (fn () (sqlite/query-one db \"select count(*) as n from users\")))   ;~> {:n 1}"
+  (let (pid (get db :pid))
+    (if (contains? *held* pid)
+      (f)
+      (do
+        (acquire db)
+        (try
+          (binding (*held* (conj *held* pid)) (f))
+          (finally (send (get db :gate) [:release (self)])))))))
+
 (defn- ask (db message)
-  (let (reply (gen/call-timeout (get db :pid) message *call-timeout*))
-    (match reply
-      ([:ok value] value)
-      ([:error message] (error "sqlite: " message)))))
+  (exclusive db
+    (fn ()
+      (match (gen/call-timeout (get db :pid) message *call-timeout*)
+        ([:ok value] value)
+        ([:error message] (error "sqlite: " message))))))
 
 ;; ---- the API ----------------------------------------------------------------------
 
@@ -110,20 +211,25 @@
   only `file`'s directory. Raises when the database cannot be opened.
 
   SQLite runs without file locking here (WASI has none), so one handle per database file:
-  two handles writing one file at once can corrupt it.
+  two handles writing one file at once can corrupt it. Share the handle instead; its
+  statements run one at a time, and `exclusive` and `transaction` keep a run of them
+  together.
 
-      (sqlite/open \"app.db\")   ;~> {:pid <pid> :file \"app.db\"}"
-  (let (pid (gen/start connection-server {:file file})
-        db {:pid pid :file file})
+      (sqlite/open \"app.db\")   ;~> {:pid <pid> :gate <pid> :file \"app.db\"}"
+  (let (pid (gen/start connection-server {:file file}))
     (match (gen/call-timeout pid :status *call-timeout*)
-      ([:ok _] db)
+      ([:ok _] {:pid pid :gate (spawn (gate pid)) :file file})
       ([:error message] (gen/stop pid) (error "sqlite/open: " file ": " message)))))
 
 (defn close (db)
-  "Close `db`: the connection process exits and the component goes with it.
+  "Close `db`: the connection process exits and the component goes with it. When it
+  returns the handle is closed for everyone: a later call raises that it is.
 
       (sqlite/close db)   ;~> nil"
-  (gen/stop (get db :pid)))
+  (let (watch (monitor (get db :gate)))
+    (gen/stop (get db :pid))
+    ;; the gate leaves with its connection; waiting for it means no call can still pass it
+    (receive ([:down ^watch _ _] nil) (after *call-timeout* nil))))
 
 (defn execute (db sql & params)
   "Run one statement with `params` bound to its `?` placeholders; the number of rows it
@@ -169,14 +275,16 @@
 (defn transaction (db f)
   "Run `(f)` inside BEGIN … COMMIT, rolling back and re-raising if it raises; its value.
 
-  The handle is shared, so a statement another process sends to `db` while `f` runs lands
-  inside the transaction too; give a transaction its own handle when that matters.
+  It holds `db` (see `exclusive`), so a statement another process sends meanwhile waits
+  for the commit rather than landing inside the transaction.
 
       (sqlite/transaction db (fn () (sqlite/execute db \"delete from users\")))   ;~> 1"
-  (execute db "begin")
-  (let (result (try (f) (catch e (execute db "rollback") (throw e))))
-    (execute db "commit")
-    result))
+  (exclusive db
+    (fn ()
+      (execute db "begin")
+      (let (result (try (f) (catch e (execute db "rollback") (throw e))))
+        (execute db "commit")
+        result))))
 
 (defn version ()
   "The version of the SQLite library inside the component.

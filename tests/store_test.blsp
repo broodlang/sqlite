@@ -1,0 +1,277 @@
+;; store over SQLite (`sqlite/store`): the same query-as-data, repo, changesets, preloads,
+;; migrations and transactions that run on Postgres, each test on a database in memory.
+
+(defmodule store-test
+  (:use test)
+  (:alias repo)
+  (:alias query)
+  (:alias changeset)
+  (:alias migration))
+
+(defn- fresh-repo () (repo/open (sqlite/store/adaptor) {:database ":memory:"}))
+
+(describe "sqlite/store: placeholders"
+  (test "store's $N become ?N, in any order and repeated; quoted text is left alone"
+    (assert= (sqlite/store/placeholders "$1 $10 $2 $1") "?1 ?10 ?2 ?1")
+    (assert= (sqlite/store/placeholders "select '$1', \"$2\" where a = $3")
+      "select '$1', \"$2\" where a = ?3")
+    (assert= (sqlite/store/placeholders "select 'it''s $1', $1") "select 'it''s $1', ?1")
+    (assert= (sqlite/store/placeholders "cost$ $") "cost$ $")))
+
+(describe "sqlite/store: query-as-data and the repo"
+  (test "create / insert / query-as-data → row maps, values bound, never spliced"
+    (let (r (fresh-repo))
+      (repo/exec r "create table t (id integer, name text, tag text)" [])
+      (repo/exec r
+        "insert into t values ($1,$2,$3),($4,$5,$6),($7,$8,$9)"
+        [1 "ada" "x" 2 "grace" "y" 3 "alan's" "x"])
+      (let (rows (repo/all r (-> (query/table :t) (query/where [:= :tag "x"]) (query/order-by :id))))
+        (assert= (count rows) 2)
+        (assert= (get (first rows) :name) "ada")
+        (assert= (get (first rows) :id) 1)
+        (assert= (get (second rows) :name) "alan's"))
+      (assert= (get (repo/one r (-> (query/table :t) (query/where [:> :id 1]) (query/order-by :id)))
+                 :name)
+        "grace")
+      (let (names (repo/all r
+                    (-> (query/table :t)
+                      (query/select [:name])
+                      (query/where [:in :id [1 3]])
+                      (query/order-by :id))))
+        (assert= (map names :name) (list "ada" "alan's")))
+      (repo/close r)))
+  (test "insert / update / delete through the repo, with RETURNING"
+    (let (r (fresh-repo))
+      (repo/exec r "create table w (id integer, name text)" [])
+      (assert= (get (repo/insert r :w {:id 1 :name "ada"}) :name) "ada")
+      (repo/insert r :w {:id 2 :name "grace"})
+      (let (updated (repo/update r :w {:name "GRACE"} [:= :id 2]))
+        (assert= (count updated) 1)
+        (assert= (get (first updated) :name) "GRACE"))
+      (assert= (count (repo/delete r :w [:= :id 1])) 1)
+      (assert= (map (repo/all r (-> (query/table :w) (query/order-by :id))) :name) (list "GRACE"))
+      (repo/close r))))
+
+(describe "sqlite/store: schema, changeset and constraints"
+  (test "defschema → create-table → changeset → insert → query"
+    (let (r (fresh-repo)
+          users {:table :users :fields {:id :integer :name :text :age :integer} :primary-key :id})
+      (repo/create-table r users)
+      (let (cs (-> (changeset/cast {} {:id 1 :name "ada" :age 36 :role "admin"} [:id :name :age])
+                 (changeset/validate-required [:name])
+                 (changeset/validate :age (fn (a) (>= a 0)) "must be non-negative")))
+        (is (changeset/valid? cs))
+        (repo/insert r :users (changeset/changes cs)))
+      (let (rows (repo/all r (query/table :users)))
+        (assert= (count rows) 1)
+        (assert= (get (first rows) :age) 36))
+      (repo/close r)))
+  (test "a unique index's violation is the field error its changeset declared"
+    (let (r (fresh-repo)
+          insert (fn (email)
+                   (repo/insert-changeset r
+                     (-> (changeset/cast {} {:email email} [:email])
+                       (changeset/unique-constraint :email {:name "users_email_idx"}))
+                     {:table :users})))
+      (repo/exec r "create table users (id integer primary key, email text)" [])
+      (repo/exec r "create unique index users_email_idx on users (email)" [])
+      (assert= (first (insert "ada@example.com")) :ok)
+      (let ([outcome cs] (insert "ada@example.com"))
+        (assert= outcome :error)
+        (assert= (changeset/error-for cs :email) "has already been taken"))
+      (repo/close r)))
+  (test "a failed statement raises store's error map, naming what SQLite named"
+    (let (r (fresh-repo))
+      (repo/exec r "create table t (a text not null, b text, unique (a, b))" [])
+      (repo/exec r "insert into t values ($1, $2)" ["x" "y"])
+      (let (unique (try (repo/exec r "insert into t values ($1, $2)" ["x" "y"]) (catch e e))
+            not-null (try (repo/exec r "insert into t values (null, $1)" ["y"]) (catch e e))
+            syntax (try (repo/exec r "selec 1" []) (catch e e)))
+        (assert= (get unique :violation) :unique)
+        (assert= (get unique :table) "t")
+        (is (string/starts-with? (get unique :constraint) "sqlite_autoindex_t"))
+        (assert= [(get not-null :violation) (get not-null :column)] [:not-null "a"])
+        (assert= (get syntax :store-error) :query)
+        (is (nil? (get syntax :violation)))
+        (is (includes? (get syntax :message) "syntax error")))
+      (repo/close r))))
+
+(describe "sqlite/store: associations and preloads (one query each)"
+  (test "has-many and belongs-to"
+    (let (r (fresh-repo)
+          users {:table :users
+                 :primary-key :id
+                 :fields {:id :integer :name :text}
+                 :associations {:posts {:type :has-many :table :posts :fk :author_id}}}
+          posts {:table :posts
+                 :primary-key :id
+                 :fields {:id :integer :author_id :integer :title :text}
+                 :associations {:author {:type :belongs-to
+                                         :table :users
+                                         :fk :author_id
+                                         :references :id}}})
+      (repo/create-table r users)
+      (repo/create-table r posts)
+      (repo/insert r :users {:id 1 :name "ada"})
+      (repo/insert r :users {:id 2 :name "grace"})
+      (repo/insert r :posts {:id 10 :author_id 1 :title "a1"})
+      (repo/insert r :posts {:id 11 :author_id 1 :title "a2"})
+      (repo/insert r :posts {:id 12 :author_id 2 :title "g1"})
+      (let (loaded (repo/preload r
+                     users
+                     (repo/all r (-> (query/table :users) (query/order-by :id)))
+                     :posts))
+        (assert= (map loaded (fn (user) (count (get user :posts)))) (list 2 1)))
+      (let (loaded (repo/preload r
+                     posts
+                     (repo/all r (-> (query/table :posts) (query/order-by :id)))
+                     :author))
+        (assert= (map loaded (fn (post) (get (get post :author) :name))) (list "ada" "ada" "grace")))
+      (repo/close r)))
+  (test "a nested preload {:posts :comments} loads two levels"
+    (let (r (fresh-repo)
+          comment {:table :comments
+                   :primary-key :id
+                   :fields {:id :integer :post_id :integer :body :text}}
+          post {:table :posts
+                :primary-key :id
+                :fields {:id :integer :author_id :integer :title :text}
+                :associations {:comments {:type :has-many
+                                          :table :comments
+                                          :fk :post_id
+                                          :schema (fn () comment)}}}
+          users {:table :users
+                 :primary-key :id
+                 :fields {:id :integer :name :text}
+                 :associations {:posts {:type :has-many
+                                        :table :posts
+                                        :fk :author_id
+                                        :schema (fn () post)}}})
+      (repo/create-table r users)
+      (repo/create-table r post)
+      (repo/create-table r comment)
+      (repo/insert r :users {:id 1 :name "ada"})
+      (repo/insert r :posts {:id 10 :author_id 1 :title "a1"})
+      (repo/insert r :posts {:id 11 :author_id 1 :title "a2"})
+      (repo/insert r :comments {:id 100 :post_id 10 :body "c1"})
+      (repo/insert r :comments {:id 101 :post_id 10 :body "c2"})
+      (repo/insert r :comments {:id 102 :post_id 11 :body "c3"})
+      (let (loaded (repo/preload r users (repo/all r (query/table :users)) {:posts :comments})
+            loaded-posts (seq/sort-by (get (first loaded) :posts) :id))
+        (assert= (map loaded-posts (fn (post) (count (get post :comments)))) (list 2 1)))
+      (repo/close r)))
+  (test "many-to-many through a join table"
+    (let (r (fresh-repo)
+          tag {:table :tags :primary-key :id :fields {:id :integer :name :text}}
+          post {:table :posts
+                :primary-key :id
+                :fields {:id :integer :title :text}
+                :associations {:tags {:type :many-to-many
+                                      :table :tags
+                                      :join-table :post_tags
+                                      :join-keys [:post_id :tag_id]
+                                      :references :id
+                                      :schema (fn () tag)}}})
+      (repo/create-table r post)
+      (repo/create-table r tag)
+      (repo/exec r "create table post_tags (post_id integer, tag_id integer)" [])
+      (repo/insert r :posts {:id 10 :title "a1"})
+      (repo/insert r :posts {:id 11 :title "a2"})
+      (repo/insert r :tags {:id 1 :name "elixir"})
+      (repo/insert r :tags {:id 2 :name "lisp"})
+      (repo/insert r :tags {:id 3 :name "sql"})
+      (repo/exec r "insert into post_tags values (10,1),(10,2),(11,3)" [])
+      (let (loaded (repo/preload r
+                     post
+                     (repo/all r (-> (query/table :posts) (query/order-by :id)))
+                     :tags))
+        (assert= (sort (map (get (first loaded) :tags) :name)) (list "elixir" "lisp"))
+        (assert= (map (get (second loaded) :tags) :name) (list "sql")))
+      (repo/close r))))
+
+(def- account-v1
+  {:version 1
+   :name "account"
+   :up [[:create-table :account {:primary-key :id :fields {:id :integer :name :text}}]]})
+
+(def- account-v2
+  {:version 2
+   :name "account-balance"
+   :up [[:add-column :account :balance :numeric] [:add-column :account :active :boolean]]})
+
+(describe "sqlite/store: versioned migrations"
+  (test "migrate applies only what is pending; rows survive the ALTER"
+    (let (r (fresh-repo))
+      (assert= (count (migration/migrate r [account-v1])) 1)
+      (assert= (sort (repo/columns r :account)) (list :id :name))
+      (repo/insert r :account {:id 1 :name "ada"})
+      (assert= (map (migration/migrate r [account-v1 account-v2]) :version) (list 2))
+      (assert= (sort (repo/columns r :account)) (list :active :balance :id :name))
+      (is (empty? (migration/pending r [account-v1 account-v2])))
+      (let (row (repo/one r (-> (query/table :account) (query/where [:= :id 1]))))
+        (assert= (get row :name) "ada")
+        (is (nil? (get row :balance))))
+      (repo/close r)))
+  (test "rollback reverses the last migration"
+    (let (r (fresh-repo))
+      (migration/migrate r [account-v1 account-v2])
+      (migration/rollback r [account-v1 account-v2])
+      (assert= (sort (repo/columns r :account)) (list :id :name))
+      (assert= (map (migration/pending r [account-v1 account-v2]) :version) (list 2))
+      (repo/close r))))
+
+(describe "sqlite/store: transactions"
+  (test "commits on success, rolls back on a raise, and sees its own writes"
+    (let (r (fresh-repo)
+          balance (fn ()
+                    (get (repo/one r (-> (query/table :account) (query/where [:= :id 1]))) :balance)))
+      (repo/exec r "create table account (id integer, balance integer)" [])
+      (repo/insert r :account {:id 1 :balance 100})
+      (assert= (repo/transaction r
+                 (fn (tx)
+                   (repo/update tx :account {:balance 90} [:= :id 1])
+                   (repo/insert tx :account {:id 2 :balance 10})
+                   :done))
+        :done)
+      (assert= (balance) 90)
+      (assert= (try
+                 (repo/transaction r
+                   (fn (tx) (repo/update tx :account {:balance 0} [:= :id 1]) (throw "boom")))
+                 (catch e (error-message e)))
+        "boom")
+      (assert= (balance) 90)
+      (assert= (repo/transaction r
+                 (fn (tx)
+                   (repo/insert tx :account {:id 3 :balance 5})
+                   (count (repo/all tx (query/table :account)))))
+        3)
+      (repo/close r)))
+  (test "a nested transaction is a savepoint: its failure undoes only its own work"
+    (let (r (fresh-repo))
+      (repo/exec r "create table t (id integer)" [])
+      (repo/transaction r
+        (fn (tx)
+          (repo/insert tx :t {:id 1})
+          (try
+            (repo/transaction tx (fn (inner) (repo/insert inner :t {:id 2}) (throw "inner")))
+            (catch e (assert= (error-message e) "inner")))))
+      (assert= (map (repo/all r (query/table :t)) :id) (list 1))
+      (repo/close r)))
+  (test "another process's statement waits for the commit instead of landing inside it"
+    (let (r (fresh-repo)
+          parent (self))
+      (repo/exec r "create table t (id integer)" [])
+      (try
+        (repo/transaction r
+          (fn (tx)
+            (repo/insert tx :t {:id 1})
+            (spawn (do (repo/insert r :t {:id 2}) (send parent :inserted)))
+            (receive
+              (:inserted (throw "the other process ran inside the transaction"))
+              (after 100 nil))
+            (throw "roll back")))
+        (catch e (assert= (error-message e) "roll back")))
+      (receive (:inserted nil) (after 5000 (throw "the other process never ran")))
+      ;; the rollback took only this transaction's row
+      (assert= (map (repo/all r (query/table :t)) :id) (list 2))
+      (repo/close r))))

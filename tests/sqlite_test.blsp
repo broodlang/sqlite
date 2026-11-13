@@ -111,3 +111,27 @@
       (sqlite/close db)))
   (test "the library inside reports its version"
     (is (string/starts-with? (sqlite/version) "3."))))
+
+(describe "sqlite: one process at a time"
+  (test "a process that dies holding the connection has its transaction rolled back"
+    (let (db (sqlite/open ":memory:")
+          parent (self))
+      (sqlite/execute-batch db "create table t (id integer)")
+      (let (holder (spawn (sqlite/exclusive db
+                            (fn ()
+                              (sqlite/execute db "begin")
+                              (sqlite/execute db "insert into t values (1)")
+                              (send parent :began)
+                              (receive (:never nil))))))
+        (receive (:began nil) (after 5000 (throw "the holder never began")))
+        (exit holder :kill))
+      ;; this waits for the gate, which rolls back before handing it on
+      (assert= (sqlite/query db "select count(*) as n from t") [{:n 0}])
+      (sqlite/transaction db (fn () (sqlite/execute db "insert into t values (2)")))
+      (assert= (sqlite/query db "select id from t") [{:id 2}])
+      (sqlite/close db)))
+  (test "a closed database says so"
+    (let (db (sqlite/open ":memory:"))
+      (sqlite/close db)
+      (assert= (try (sqlite/query db "select 1") (catch e (error-message e)))
+        "sqlite: :memory: is closed"))))
