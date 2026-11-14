@@ -78,7 +78,6 @@ impl GuestConnection for Connection {
         let mut statement = connection.prepare(&sql).map_err(message)?;
         let columns: Vec<String> = statement
             .column_names()
-            .into_iter()
             .map(str::to_string)
             .collect();
         let width = columns.len();
