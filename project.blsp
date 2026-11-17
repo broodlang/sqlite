@@ -7,4 +7,4 @@
     "SQLite as a sandboxed WebAssembly component: open a database file or :memory:, then execute, query and transaction on a shared connection process, and a database for the store library (sqlite/store). No native code on the host."
   :repository "https://github.com/broodlang/sqlite"
   ;; for tests/store_test.blsp only: sqlite/store builds the adaptor map without store
-  :dev-dependencies [[store :version "^0.9.5"]])
+  :dev-dependencies [[store :version "^0.9.6"]])
