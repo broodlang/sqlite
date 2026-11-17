@@ -16,7 +16,7 @@
 
       (sqlite/store/placeholders \"select $2, '$1' where id = $1\")   ;=> \"select ?2, '$1' where id = ?1\""
   (let (step (fn (state character)
-               (let (quote (get state :quote)
+               (let (open-quote (get state :quote)
                      out (get state :out)
                      dollar (get state :dollar)
                      digit (and dollar (not (nil? (regex/find character "^[0-9]$"))))
@@ -25,11 +25,11 @@
                            dollar (conj out "$")
                            else out))
                  (cond
-                   (and (nil? quote) (= character "$")) {:quote nil :out out :dollar true}
-                   (and (nil? quote) (or (= character "'") (= character "\"")))
+                   (and (nil? open-quote) (= character "$")) {:quote nil :out out :dollar true}
+                   (and (nil? open-quote) (or (= character "'") (= character "\"")))
                      {:quote character :out (conj out character) :dollar false}
-                   (= character quote) {:quote nil :out (conj out character) :dollar false}
-                   else {:quote quote :out (conj out character) :dollar false})))
+                   (= character open-quote) {:quote nil :out (conj out character) :dollar false}
+                   else {:quote open-quote :out (conj out character) :dollar false})))
         finished (fold (string/->list sql) {:quote nil :out [] :dollar false} step))
     (string/join (if (get finished :dollar) (conj (get finished :out) "$") (get finished :out)) "")))
 
