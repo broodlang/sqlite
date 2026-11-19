@@ -146,18 +146,19 @@
                       (into [] (rest pending)))))))
     (receive
       ([:down ^connection-watch _ _] nil)
-      ([:acquire caller token] (if (nil? holder)
-                                 (grant [[caller token]])
-                                 (again (conj waiting [caller token]))))
-      ([:release caller] (if (and holder (= caller (get holder :pid)))
-                           (do (demonitor (get holder :watch)) (grant waiting))
-                           (again waiting)))
+      ([:acquire caller token]
+        (if (nil? holder) (grant [[caller token]]) (again (conj waiting [caller token]))))
+      ([:release caller]
+        (if (and holder (= caller (get holder :pid)))
+          (do (demonitor (get holder :watch)) (grant waiting))
+          (again waiting)))
       ;; The holder died: whatever it began is rolled back before the next process gets the
       ;; connection, as a server does when a client's connection drops. Any other down is
       ;; of a holder that had already released.
-      ([:down watch _ _] (if (and holder (= watch (get holder :watch)))
-                           (do (rollback-quietly connection) (grant waiting))
-                           (again waiting)))
+      ([:down watch _ _]
+        (if (and holder (= watch (get holder :watch)))
+          (do (rollback-quietly connection) (grant waiting))
+          (again waiting)))
       ;; A process that stopped waiting (its call timed out) is no longer in line.
       ([:withdraw caller] (again (into [] (seq/reject waiting (fn ([waiter _]) (= waiter caller)))))))))
 
